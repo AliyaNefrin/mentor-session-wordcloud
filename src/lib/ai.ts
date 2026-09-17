@@ -72,13 +72,13 @@ async function transcribeAndAnalyzeWithGroq(
   filename: string,
   apiKey: string
 ): Promise<AIAnalysisResponse> {
-  // Step 1: Transcribe with Whisper-large-v3
+  // Step 1: Transcribe with Whisper-large-v3 (auto-detect language)
   const formData = new FormData();
   const blob = new Blob([new Uint8Array(audioBuffer)], { type: 'audio/wav' });
   formData.append('file', blob, filename || 'recording.wav');
   formData.append('model', 'whisper-large-v3');
   formData.append('response_format', 'verbose_json');
-  formData.append('language', 'en');
+  // Auto-detect language so multilingual speech (e.g. English, Malayalam, etc.) is supported
 
   const transcriptionRes = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
     method: 'POST',
@@ -100,7 +100,7 @@ async function transcribeAndAnalyzeWithGroq(
     throw new Error('The recording appears to be silent or contains no recognizable speech.');
   }
 
-  // Step 2: Semantic Term Prominence Extraction with LLaMA 3.3
+  // Step 2: Semantic Term Prominence Extraction with auto-fallback models
   const extractionPrompt = `You are an AI analyzing a live 1-to-1 mentorship session between a mentor and a student.
 Answer this key question: "What was this session actually about?"
 
@@ -124,42 +124,70 @@ Format your output strictly as a JSON object with this shape:
   ]
 }`;
 
-  const completionRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
-      messages: [
-        {
-          role: 'system',
-          content: 'You are an expert educational AI analyst. Output strictly valid JSON without markdown fences.',
-        },
-        { role: 'user', content: extractionPrompt },
-      ],
-      temperature: 0.2,
-      response_format: { type: 'json_object' },
-    }),
-  });
+  // Groq models in order of universal availability and speed
+  const CANDIDATE_MODELS = [
+    'llama-3.1-8b-instant',
+    'llama-3.3-70b-versatile',
+    'llama3-70b-8192',
+    'llama3-8b-8192',
+    'mixtral-8x7b-32768',
+  ];
 
-  if (!completionRes.ok) {
-    const errorText = await completionRes.text();
-    throw new Error(`Groq AI topic extraction failed (${completionRes.status}): ${errorText}`);
+  let rawContent = '{}';
+  let modelUsed = CANDIDATE_MODELS[0];
+  let lastError = '';
+
+  for (const model of CANDIDATE_MODELS) {
+    try {
+      const completionRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            {
+              role: 'system',
+              content: 'You are an expert educational AI analyst. Output strictly valid JSON without markdown fences.',
+            },
+            { role: 'user', content: extractionPrompt },
+          ],
+          temperature: 0.2,
+          response_format: { type: 'json_object' },
+        }),
+      });
+
+      if (completionRes.ok) {
+        const completionData = await completionRes.json();
+        rawContent = completionData.choices?.[0]?.message?.content || '{}';
+        modelUsed = model;
+        lastError = '';
+        break;
+      } else {
+        const errText = await completionRes.text();
+        lastError = `(${completionRes.status}): ${errText}`;
+        // If 404 model not found, try next candidate model
+        continue;
+      }
+    } catch (e: any) {
+      lastError = e.message;
+    }
   }
 
-  const completionData = await completionRes.json();
-  const rawContent = completionData.choices?.[0]?.message?.content || '{}';
-  const parsed = JSON.parse(rawContent);
+  if (lastError && rawContent === '{}') {
+    throw new Error(`Groq AI topic extraction failed: ${lastError}`);
+  }
 
+  const parsed = JSON.parse(rawContent);
   const words = sanitizeAndNormalizeWords(parsed.keywords || []);
 
   return {
     transcript,
     words,
     summary: parsed.summary || 'Mentorship session topic analysis',
-    provider: 'Groq (Whisper-large-v3 + LLaMA 3.3 70B)',
+    provider: `Groq (Whisper-large-v3 + ${modelUsed})`,
   };
 }
 
